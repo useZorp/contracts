@@ -7,6 +7,7 @@ import {HookMiner} from "@uniswap/v4-periphery/src/utils/HookMiner.sol";
 import {BaseScript} from "./base/BaseScript.sol";
 
 import {QuantumMarketHook} from "../src/QuantumMarketHook.sol";
+import {QuantumMarketManager} from "../src/QuantumMarketManager.sol";
 
 /// @notice Mines the address and deploys the QuantumMarketHook.sol Hook contract
 contract DeployHookScript is BaseScript {
@@ -18,13 +19,15 @@ contract DeployHookScript is BaseScript {
         );
 
         // Mine a salt that will produce a hook address with the correct flags
-        bytes memory constructorArgs = abi.encode(poolManager);
+        // Our hook takes (IPoolManager, QuantumMarketManager), but for deploy script example
+        // we pass a placeholder second arg (address(0)) and recommend deploying qm manager separately.
+        bytes memory constructorArgs = abi.encode(poolManager, address(0));
         (address hookAddress, bytes32 salt) =
             HookMiner.find(CREATE2_FACTORY, flags, type(QuantumMarketHook).creationCode, constructorArgs);
 
         // Deploy the hook using CREATE2
         vm.startBroadcast();
-        QuantumMarketHook counter = new QuantumMarketHook{salt: salt}(poolManager);
+        QuantumMarketHook counter = new QuantumMarketHook{salt: salt}(poolManager, QuantumMarketManager(address(0)));
         vm.stopBroadcast();
 
         require(address(counter) == hookAddress, "DeployHookScript: Hook Address Mismatch");
