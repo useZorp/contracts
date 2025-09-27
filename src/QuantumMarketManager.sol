@@ -5,15 +5,11 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
-import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {IHooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {DecisionToken, TokenType, VUSD} from "./Tokens.sol";
 import {MarketStatus, MarketConfig, ProposalConfig, ProposalTokens} from "./common/MarketData.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
-import {IPermit2} from "permit2/src/interfaces/IPermit2.sol";
-import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
 
 /// @title QuantumMarketManager
 /// @notice Manages decisions and proposals for a simplified Quantum Markets demo using Uniswap v4 hooks
@@ -41,8 +37,8 @@ contract QuantumMarketManager {
     }
 
     IPoolManager public immutable poolManager;
-    IPositionManager public positionManager;
-    IPermit2 public permit2;
+    address public factory;
+    // periphery interactions moved to external orchestrator to reduce bytecode size
 
     uint256 public nextDecisionId;
     mapping(uint256 => Decision) public decisions;
@@ -73,6 +69,16 @@ contract QuantumMarketManager {
         emit DecisionCreated(decisionId, metadata);
     }
 
+    modifier onlyFactory() {
+        require(msg.sender == factory, "factory");
+        _;
+    }
+
+    function setFactory(address f) external {
+        require(factory == address(0), "set");
+        factory = f;
+    }
+
     function createMarket(
         address creator,
         address marketToken,
@@ -80,7 +86,7 @@ contract QuantumMarketManager {
         uint256 minDeposit,
         uint256 deadline,
         string memory title
-    ) external returns (uint256 marketId) {
+    ) external onlyFactory returns (uint256 marketId) {
         marketId = ++nextDecisionId;
         markets[marketId] = MarketConfig({
             id: marketId,
@@ -96,50 +102,37 @@ contract QuantumMarketManager {
         emit MarketCreated(marketId, block.timestamp, creator, title);
     }
 
-    function depositToMarket(address depositor, uint256 marketId, uint256 amount) external {
+    function depositToMarket(address depositor, uint256 marketId, uint256 amount) external onlyFactory {
         MarketConfig memory m = markets[marketId];
         require(m.id != 0, "market");
         IERC20(m.marketToken).transferFrom(depositor, address(this), amount);
         deposits[marketId][depositor] += amount;
     }
 
-    function createProposalForMarket(uint256 marketId, bytes memory data) external returns (uint256 proposalId) {
+    function createProposalForMarket(
+        uint256 marketId,
+        address creator,
+        address vUSD,
+        address yesToken,
+        address noToken,
+        bytes memory data
+    ) external onlyFactory returns (uint256 proposalId) {
         MarketConfig memory m = markets[marketId];
         require(m.id != 0, "market");
         require(m.status == MarketStatus.OPEN, "closed");
-        uint256 totalDeposited = deposits[marketId][msg.sender];
-        uint256 alreadyClaimed = proposalDepositClaims[marketId][msg.sender];
+        uint256 totalDeposited = deposits[marketId][creator];
+        uint256 alreadyClaimed = proposalDepositClaims[marketId][creator];
         uint256 claimable = totalDeposited - alreadyClaimed;
         require(claimable >= m.minDeposit, "min deposit");
-        proposalDepositClaims[marketId][msg.sender] = alreadyClaimed + m.minDeposit;
-
-        // budgets
-        uint256 D = m.minDeposit;
-        uint256 burnTotal = (D * 2) / 3; // 2/3 to YES+NO
-        uint256 tokenPerPool = burnTotal / 2;
-        uint256 vusdToMint = D - burnTotal; // 1/3 to vUSD
-        uint256 vusdPerPool = vusdToMint / 2;
-
-        // deploy tokens; manager is minter
-        VUSD vUSD = new VUSD(address(this));
-        DecisionToken yesToken = new DecisionToken(TokenType.YES, address(this));
-        DecisionToken noToken = new DecisionToken(TokenType.NO, address(this));
-
-        // seed tokens: keep pool seed in manager, give user trading inventory
-        yesToken.mint(address(this), tokenPerPool);
-        noToken.mint(address(this), tokenPerPool);
-        yesToken.mint(msg.sender, tokenPerPool);
-        noToken.mint(msg.sender, tokenPerPool);
-        // mint vUSD budget to the manager for seeding pools via seedProposalPools
-        vUSD.mint(address(this), vusdToMint);
+        proposalDepositClaims[marketId][creator] = alreadyClaimed + m.minDeposit;
 
         proposalId = ++nextProposalId;
         proposals[proposalId] = ProposalConfig({
             id: proposalId,
             marketId: marketId,
             createdAt: block.timestamp,
-            creator: msg.sender,
-            tokens: ProposalTokens({ vUSD: address(vUSD), yesToken: address(yesToken), noToken: address(noToken) }),
+            creator: creator,
+            tokens: ProposalTokens({ vUSD: vUSD, yesToken: yesToken, noToken: noToken }),
             yesPoolKey: PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(0)), fee: 0, tickSpacing: 0, hooks: IHooks(address(0))}),
             noPoolKey: PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(0)), fee: 0, tickSpacing: 0, hooks: IHooks(address(0))}),
             data: data
@@ -158,84 +151,7 @@ contract QuantumMarketManager {
         poolToDecision[noKey.toId()] = p.marketId;
     }
 
-    function setPeriphery(IPositionManager _pos, IPermit2 _permit2) external {
-        require(address(positionManager) == address(0) && address(permit2) == address(0), "set");
-        positionManager = _pos;
-        permit2 = _permit2;
-    }
-
-    function seedProposalPools(
-        uint256 proposalId,
-        address hook,
-        uint24 fee,
-        int24 spacing,
-        uint160 sqrtPriceX96,
-        uint128 liquidityDesired
-    ) external {
-        ProposalConfig storage p = proposals[proposalId];
-        require(p.id != 0, "proposal");
-        require(address(positionManager) != address(0), "periphery");
-
-        IERC20(p.tokens.vUSD).approve(address(permit2), type(uint256).max);
-        IERC20(p.tokens.yesToken).approve(address(permit2), type(uint256).max);
-        IERC20(p.tokens.noToken).approve(address(permit2), type(uint256).max);
-        permit2.approve(p.tokens.vUSD, address(positionManager), type(uint160).max, type(uint48).max);
-        permit2.approve(p.tokens.yesToken, address(positionManager), type(uint160).max, type(uint48).max);
-        permit2.approve(p.tokens.noToken, address(positionManager), type(uint160).max, type(uint48).max);
-
-        (address y0, address y1) = p.tokens.yesToken < p.tokens.vUSD
-            ? (p.tokens.yesToken, p.tokens.vUSD)
-            : (p.tokens.vUSD, p.tokens.yesToken);
-        PoolKey memory yesKey = PoolKey({
-            currency0: Currency.wrap(y0),
-            currency1: Currency.wrap(y1),
-            fee: fee,
-            tickSpacing: spacing,
-            hooks: IHooks(hook)
-        });
-        poolManager.initialize(yesKey, sqrtPriceX96);
-
-        (address n0, address n1) = p.tokens.noToken < p.tokens.vUSD
-            ? (p.tokens.noToken, p.tokens.vUSD)
-            : (p.tokens.vUSD, p.tokens.noToken);
-        PoolKey memory noKey = PoolKey({
-            currency0: Currency.wrap(n0),
-            currency1: Currency.wrap(n1),
-            fee: fee,
-            tickSpacing: spacing,
-            hooks: IHooks(hook)
-        });
-        poolManager.initialize(noKey, sqrtPriceX96);
-
-        int24 lower = TickMath.minUsableTick(spacing);
-        int24 upper = TickMath.maxUsableTick(spacing);
-        (uint256 a0, uint256 b0) = LiquidityAmounts.getAmountsForLiquidity(
-            sqrtPriceX96,
-            TickMath.getSqrtPriceAtTick(lower),
-            TickMath.getSqrtPriceAtTick(upper),
-            liquidityDesired
-        );
-        bytes memory actions = abi.encodePacked(uint8(0x11), uint8(0x12));
-        {
-            bytes[] memory ps = new bytes[](2);
-            ps[0] = abi.encode(yesKey, lower, upper, liquidityDesired, a0 + 1, b0 + 1, address(this), bytes(""));
-            ps[1] = abi.encode(yesKey.currency0, yesKey.currency1);
-            positionManager.modifyLiquidities(abi.encode(actions, ps), block.timestamp + 60);
-        }
-        {
-            bytes[] memory ps = new bytes[](2);
-            ps[0] = abi.encode(noKey, lower, upper, liquidityDesired, a0 + 1, b0 + 1, address(this), bytes(""));
-            ps[1] = abi.encode(noKey.currency0, noKey.currency1);
-            positionManager.modifyLiquidities(abi.encode(actions, ps), block.timestamp + 60);
-        }
-
-        p.yesPoolKey = yesKey;
-        p.noPoolKey = noKey;
-        poolToProposal[yesKey.toId()] = proposalId;
-        poolToProposal[noKey.toId()] = proposalId;
-        poolToDecision[yesKey.toId()] = p.marketId;
-        poolToDecision[noKey.toId()] = p.marketId;
-    }
+    // external orchestrator expected to initialize pools and add liquidity
 
     function acceptProposal(uint256 marketId, uint256 proposalId) external {
         MarketConfig storage m = markets[marketId];

@@ -28,6 +28,7 @@ contract QlickOrchestrator {
     event LiquidityAdded(uint256 tokenId, uint128 liquidity);
     event DecisionRegistered(uint256 decisionId, bytes32 proposal1, bytes32 proposal2);
     event MarketCreated(uint256 marketId);
+    event ProposalCreated(uint256 marketId, uint256 proposalId);
 
     IPoolManager public immutable poolManager;
     IPositionManager public immutable positionManager;
@@ -133,6 +134,7 @@ contract QlickOrchestrator {
 
     // New: full market flow
     function createMarket(QuantumMarketManager qm, address marketToken, address resolver, uint256 minDeposit, uint256 deadline, string calldata title) external {
+        qm.setFactory(address(this));
         lastMarketId = qm.createMarket(msg.sender, marketToken, resolver, minDeposit, deadline, title);
         emit MarketCreated(lastMarketId);
     }
@@ -149,7 +151,16 @@ contract QlickOrchestrator {
         // step 1: ensure ERC20 budgets exist
         // depositToMarket should be called off-chain to move user's marketToken to manager
         // step 2: create proposal and mint tokens
-        proposalId = qm.createProposalForMarket(lastMarketId, bytes(""));
+        // create tokens and inventory off-chain here
+        VUSD v = new VUSD(address(this));
+        DecisionToken y = new DecisionToken(TokenType.YES, address(this));
+        DecisionToken n = new DecisionToken(TokenType.NO, address(this));
+        v.mint(address(this), 1e24);
+        y.mint(msg.sender, 5e23);
+        n.mint(msg.sender, 5e23);
+
+        proposalId = qm.createProposalForMarket(lastMarketId, msg.sender, address(v), address(y), address(n), bytes(""));
+        emit ProposalCreated(lastMarketId, proposalId);
 
         // step 3: initialize two pools YES/VUSD and NO/VUSD
         // For demo, we create mock tokens here and use them; in prod, caller would supply tokens
