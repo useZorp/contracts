@@ -10,7 +10,6 @@ contract SettleDecision is Script {
         vm.startBroadcast();
         QuantumMarketManager(qmAddress).settle(decisionId, winningProposalId);
         vm.stopBroadcast();
-        console.log("Settled decision", decisionId, "with", winningProposalId);
     }
 }
 

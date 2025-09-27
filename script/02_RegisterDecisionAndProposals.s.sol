@@ -40,7 +40,6 @@ contract RegisterDecisionAndProposals is Script {
         vm.stopBroadcast();
 
         console.log("Registered decision:", decisionId);
-        console.log("Proposals:", bytes32(p1), bytes32(p2));
     }
 }
 
