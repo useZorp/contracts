@@ -134,7 +134,9 @@ contract QlickOrchestrator {
 
     // New: full market flow
     function createMarket(QuantumMarketManager qm, address marketToken, address resolver, uint256 minDeposit, uint256 deadline, string calldata title) external {
-        qm.setFactory(address(this));
+        if (qm.factory() == address(0)) {
+            qm.setFactory(address(this));
+        }
         lastMarketId = qm.createMarket(msg.sender, marketToken, resolver, minDeposit, deadline, title);
         emit MarketCreated(lastMarketId);
     }
