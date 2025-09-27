@@ -17,6 +17,8 @@ import {IPermit2} from "permit2/src/interfaces/IPermit2.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 
 import {QuantumMarketManager} from "./QuantumMarketManager.sol";
+import {VUSD, DecisionToken, TokenType} from "./Tokens.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract QlickOrchestrator {
     using CurrencyLibrary for Currency;
@@ -25,6 +27,7 @@ contract QlickOrchestrator {
     event PoolCreated(PoolId poolId);
     event LiquidityAdded(uint256 tokenId, uint128 liquidity);
     event DecisionRegistered(uint256 decisionId, bytes32 proposal1, bytes32 proposal2);
+    event MarketCreated(uint256 marketId);
 
     IPoolManager public immutable poolManager;
     IPositionManager public immutable positionManager;
@@ -39,6 +42,7 @@ contract QlickOrchestrator {
     uint256 public lastDecisionId;
     bytes32 public lastProposal1;
     bytes32 public lastProposal2;
+    uint256 public lastMarketId;
 
     constructor(
         IPoolManager _poolManager,
@@ -125,6 +129,74 @@ contract QlickOrchestrator {
         lastProposal1 = p1;
         lastProposal2 = p2;
         emit DecisionRegistered(decisionId, p1, p2);
+    }
+
+    // New: full market flow
+    function createMarket(QuantumMarketManager qm, address marketToken, address resolver, uint256 minDeposit, uint256 deadline, string calldata title) external {
+        lastMarketId = qm.createMarket(msg.sender, marketToken, resolver, minDeposit, deadline, title);
+        emit MarketCreated(lastMarketId);
+    }
+
+    function createProposalWithDualPools(
+        QuantumMarketManager qm,
+        address hook,
+        uint24 fee,
+        int24 spacing,
+        uint160 sqrtPriceX96,
+        uint128 liquidityDesired
+    ) external returns (uint256 proposalId, PoolKey memory yesKey, PoolKey memory noKey) {
+        require(lastMarketId != 0, "market not created");
+        // step 1: ensure ERC20 budgets exist
+        // depositToMarket should be called off-chain to move user's marketToken to manager
+        // step 2: create proposal and mint tokens
+        proposalId = qm.createProposalForMarket(lastMarketId, bytes(""));
+
+        // step 3: initialize two pools YES/VUSD and NO/VUSD
+        // For demo, we create mock tokens here and use them; in prod, caller would supply tokens
+        VUSD vUSD = new VUSD(address(this));
+        DecisionToken yesToken = new DecisionToken(TokenType.YES, address(this));
+        DecisionToken noToken = new DecisionToken(TokenType.NO, address(this));
+        vUSD.mint(address(this), 1e24);
+        yesToken.mint(address(this), 1e24);
+        noToken.mint(address(this), 1e24);
+
+        // Approvals
+        IERC20(address(vUSD)).approve(address(permit2), type(uint256).max);
+        IERC20(address(yesToken)).approve(address(permit2), type(uint256).max);
+        IERC20(address(noToken)).approve(address(permit2), type(uint256).max);
+        permit2.approve(address(vUSD), address(positionManager), type(uint160).max, type(uint48).max);
+        permit2.approve(address(yesToken), address(positionManager), type(uint160).max, type(uint48).max);
+        permit2.approve(address(noToken), address(positionManager), type(uint160).max, type(uint48).max);
+
+        (address t0a, address t1a) = address(yesToken) < address(vUSD) ? (address(yesToken), address(vUSD)) : (address(vUSD), address(yesToken));
+        (address t0b, address t1b) = address(noToken) < address(vUSD) ? (address(noToken), address(vUSD)) : (address(vUSD), address(noToken));
+        yesKey = PoolKey({ currency0: Currency.wrap(t0a), currency1: Currency.wrap(t1a), fee: fee, tickSpacing: spacing, hooks: IHooks(hook) });
+        noKey  = PoolKey({ currency0: Currency.wrap(t0b), currency1: Currency.wrap(t1b), fee: fee, tickSpacing: spacing, hooks: IHooks(hook) });
+
+        poolManager.initialize(yesKey, sqrtPriceX96);
+        poolManager.initialize(noKey, sqrtPriceX96);
+
+        int24 lower = TickMath.minUsableTick(spacing);
+        int24 upper = TickMath.maxUsableTick(spacing);
+        (uint256 a0, uint256 b0) = LiquidityAmounts.getAmountsForLiquidity(sqrtPriceX96, TickMath.getSqrtPriceAtTick(lower), TickMath.getSqrtPriceAtTick(upper), liquidityDesired);
+        (uint256 a1, uint256 b1) = (a0, b0);
+
+        bytes memory actions = abi.encodePacked(uint8(0x11), uint8(0x12));
+        {
+            bytes[] memory ps = new bytes[](2);
+            ps[0] = abi.encode(yesKey, lower, upper, liquidityDesired, a0 + 1, b0 + 1, address(this), bytes(""));
+            ps[1] = abi.encode(yesKey.currency0, yesKey.currency1);
+            positionManager.modifyLiquidities(abi.encode(actions, ps), block.timestamp + 3600);
+        }
+        {
+            bytes[] memory ps = new bytes[](2);
+            ps[0] = abi.encode(noKey, lower, upper, liquidityDesired, a1 + 1, b1 + 1, address(this), bytes(""));
+            ps[1] = abi.encode(noKey.currency0, noKey.currency1);
+            positionManager.modifyLiquidities(abi.encode(actions, ps), block.timestamp + 3600);
+        }
+
+        // link pools to proposal in manager
+        qm.setProposalPools(proposalId, yesKey, noKey);
     }
 
     function swapOnPool(bool zeroForOne, uint256 amountIn) external {
